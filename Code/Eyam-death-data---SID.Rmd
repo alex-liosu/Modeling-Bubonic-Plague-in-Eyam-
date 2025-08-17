@@ -1,0 +1,435 @@
+---
+title: "Eyam death data"
+author: "Alan Gan"
+date: "`r Sys.Date()`"
+output: html_document
+header-includes:
+  \usepackage{amsmath}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(deSolve) # for ode()
+library(mvtnorm) # for rmvnorm()
+library(invgamma) # for dinvgamma()
+```
+
+## Extract Data
+
+```{r}
+data = read.table("Eyam_time_SIR.csv",sep = ",")
+data[data=="NaN"]=NA
+data = as.matrix(data)
+colnames(data) = c("time","S","I","R")
+times = data[,"time"]; 
+data = data[,-1]
+plot(times,data[,3], xlab = "Time", ylab = "Deaths")
+
+
+eyam <- as.data.frame(cbind(times, data[,3]))
+colnames(eyam) <- c("times", "D")
+```
+
+We fit the data to an SID (Susceptible, Infected, Dead) model specified by the following system of ordinary differential equations:
+
+```{=tex}
+\begin{align*}
+ &  \frac{dS}{dt} = -\frac{\beta S I}{N} \\
+ &  \frac{dI}{dt} = \frac{\beta S I}{N} - \gamma I \\
+ &  \frac{dD}{dt} = \gamma I
+\end{align*}
+```
+with the following initial conditions $S(0) = S_0, \ I(0) = I_0, \ D(0) = 0$. And where $N = S_0 + I_0$.
+
+```{r}
+
+sir.rhs <- function(time, state, params) {
+  # Evaluates the RHS of SIR ODE
+  
+  S <- state[1]
+  I <- state[2]
+  R <- state[3]
+  N <- sum(S,I,R)
+  
+  beta <- params[1]
+  gamma <- params[2]
+  #N <- params[3]
+  
+  dsdt <- -beta * I * S / N
+  didt <- beta * I * S / N - gamma * I
+  drdt <- gamma * I
+  
+  return(list(c(dsdt, didt, drdt)))
+}
+
+
+
+## Testing ODE solver on SIR model
+
+# sir.init <- c(100, 10, 0)
+# names(sir.init) <- c("Susceptible", "Infected", "Dead")
+# params <- c(2,1)
+# 
+# sir.out <- ode(sir.init, times, sir.rhs, params)
+# matplot(sir.out[,1], sir.out[,2:4], type = 'l')
+
+
+```
+
+```{r, ech0 = F, eval = F, include = F}
+## Just testing different parameter values
+
+# plot(times, eyam$D,
+#      col = "red",
+#      ylim = c(0, max(eyam$D)+10),
+#      main = "Fitted Curve",
+#      ylab = "Deaths", xlab = "Time")
+# lines(times, nls_eyam_1(times, 0.06, 0.04, 400, 21), col = 'blue2')
+```
+
+\vspace{50mm}
+
+## Fitting SID model to Eyam data using Non-Linear Least Squares
+
+
+Assuming that $\beta, \gamma, S_0, I_0$ are unknown, we fit the above model to the data using non-linear least squares.
+
+
+```{r nls}
+
+## Function to run SID model (given a set of parameters) and return number of deads
+nls_eyam_1 <- function(times, beta, gamma, S0, I0) {
+  sir.init <- c(S0, I0, 0)
+  names(sir.init) <- c("Susceptible", "Infected", "Dead")
+  params <- c(beta, gamma)
+  
+  sir.out <- ode(sir.init, times, sir.rhs, params)
+  return(sir.out[,4])
+}
+
+
+## fitting SID model to data using nls()
+eyam_fit_1 <- nls(D ~ nls_eyam_1(times, beta, gamma, S0, I0), data = eyam, start = list(beta = 0.2, gamma = 0.1, S0 = 400, I0 = 5))
+
+
+
+## Plotting the fitted versus data
+plot(times, eyam$D,
+     col = 3,
+     ylim = c(0, max(eyam$D)+10),
+     main = "Fitted Curve",
+     ylab = "Deaths", xlab = "Time")
+#lines(times, nls_eyam_1(times, eyam_fit_1$m$getAllPars()[1], eyam_fit_1$m$getAllPars()[2], eyam_fit_1$m$getAllPars()[3], eyam_fit_1$m$getAllPars()[4]), col = 'blue2')
+lines(times, fitted(eyam_fit_1), col = 'blue2')
+legend("topleft", legend = c("Data", "Fitted"), col = c(3, "blue"), pch = c(1,NA), lty = c(NA, 1))
+
+
+## Plotting entire fitted SID trajectory
+par(mar=c(5.1, 4.1, 4.1, 8.1), xpd=TRUE)
+matplot(times, ode(c(eyam_fit_1$m$getAllPars()[3], eyam_fit_1$m$getAllPars()[4], 0), times, sir.rhs, c(eyam_fit_1$m$getAllPars()[1], eyam_fit_1$m$getAllPars()[2]))[,2:4], type = 'l', main = "Fitted SID Trajectory", ylab = "People", xlab = "Time", lty = 1)
+points(times, eyam$D, cex = 0.5, col = 3)
+legend("topright", legend = c("Susc.", "Infec.", "Dead", "Death Data"), col = c(1:3, 3), lty = c(1,1,1,NA), pch = c(NA,NA,NA,1), inset=c(-0.3,0))
+
+
+## Fitted parameter values
+round(eyam_fit_1$m$getAllPars(),4)
+
+
+## Fitted estimate for R0
+unname(eyam_fit_1$m$getAllPars()[1] / eyam_fit_1$m$getAllPars()[2])
+```
+
+The fitted model looks quite close to the data.
+
+\vspace{50mm}
+
+## Bayesian Fitting SID model to Eyam data using MCMC
+
+Let
+
+$$D(t, \theta) = \text{number of deaths up to time } t$$
+
+where $\theta = (\beta, \gamma, S_0, I_0)$ and \$N = S_0 + I_0 \$ (note: $D_0 = 0$). $D(t, \theta)$ is the solution to the SID ODE system.
+
+We observe data
+
+$$y(t_i) = D(t_i, \theta) + \epsilon_{t_i}$$
+
+where $\epsilon_{t_i} \overset{\mathrm{iid}}{\sim} N(0, \sigma^2)$.
+
+Our priors for parameter $\theta$ and $\sigma$ are:
+
+```{=tex}
+\begin{align*}
+  &\beta \sim g(\beta) \\
+  &\gamma \sim h(\gamma) \\
+  &S_0 \sim l(S_0) \\
+  &I_0 \sim m(I_0) \\
+  &\sigma \sim p(\sigma)
+\end{align*}
+```
+So if our data is $\vec{y} = \left[ y(t_i)\right]_{i=1:n}$, we want to sample from the posterior of $\theta$
+
+$$\pi(\theta|\vec{y}) \propto \left(\prod_{i=1}^n N( \ y(t_i); \ D(t_i, \theta), \ \sigma^2) \right) g(\beta) h(\gamma) l(S_0) m(I_0) p(\sigma) $$
+
+This is the target density. And its log is
+
+$$\mathrm{log}(\pi(\theta | \vec{y})) = \left(-\frac{n}{2}\mathrm{log}(\sigma^2) - \frac{1}{2\sigma^2} \sum_{i=1}^n\left[y(t_i) - D(t_i, \theta)\right]^2 \right) + \mathrm{log}(g(\beta)) + \mathrm{log}(h(\gamma)) + \mathrm{log}(l(S_0)) + \mathrm{log}(m(I_0)) + \mathrm{log}(p(\sigma))$$
+
+We use MCMC to sample from this density.
+
+For our analysis, our priors are as follows: $\beta$ and $\gamma$ have flat priors constrained between $0$ and $100$. $S_0$ has a flat prior constrained $> 184$. $I_0$ has a flat prior constrained $> 0$. And $\sigma^2$ has an inverse gamma prior with shape and scale parameters $1$ and $1$, respectively.
+
+```{r mcmc}
+## Metropolis-Hastings
+
+MH <- function(N.mc, dat, prop.f, log.prop.d, log.lik.d, log.target.d, init, sym = T, proposal.cov = diag(length(init)), step.size = 1) {
+  # N.mc: The number of MCMC samples to run
+  # dat: The data
+  # prop.f(theta.old, proposal.cov): Function that returns a proposal
+  # log.prop.d(theta.new, theta.old): Function that returns the log density of the proposal
+  # log.lik.d(dat, theta): Function that returns the log likelihood of the data given a set of parameters
+  # log.target.d: Function that returns the log target density
+  #               (it contains the information about the priors.)
+  # init: The inital point. 
+  # sym: "T" means we are using a symmetric proposal. "F" means otherwise.
+  
+  # theta = (beta, gamma, S0, I0, sigma)
+  
+  if (!sym) {
+    stop("Have not implemented non-symmetric proposals yet.")
+  }
+  
+  num.params <- length(init)
+  
+  theta.s <- matrix(NA, ncol = (N.mc+1), nrow = num.params) # for storing the samples
+  theta.s[,1] <- init # initial value
+  
+  AR <- rep(NA, N.mc) # for storing when we reject/accept
+  log.lik <- rep(NA, N.mc+1) # for storing the log likelihoods
+  log.targ.dens <- rep(NA, N.mc+1)
+  
+  log.lik[1] <- log.lik.d(dat, init)
+  log.targ.dens[1] <- log.target.d(log.lik[1], init)
+  
+  for (i in 2:(N.mc+1)) {
+    
+    ## Proposal step
+    
+    prop <- prop.f(theta.s[,i-1], proposal.cov*step.size)
+    
+    
+    ## Accept/Reject step
+    
+    prop.log.lik <- log.lik.d(dat, prop) # the log likelihood at the proposed valued
+    prop.log.targ.dens <- log.target.d(prop.log.lik, prop)
+    
+    log.ratio <- prop.log.targ.dens - log.targ.dens[i-1]
+    if (is.na(log.ratio)) {
+      cat("i =", i, "\n")
+      cat("prop = ", prop, "\n")
+      #cat("")
+    }
+    AR[i-1] <- log(runif(1)) < log.ratio
+    
+    if (AR[i-1]) { # Accept
+      theta.s[,i] <- prop
+      log.lik[i] <- prop.log.lik
+      log.targ.dens[i] <- prop.log.targ.dens
+    } else { # Reject
+      theta.s[,i] <- theta.s[,i-1]
+      log.lik[i] <- log.lik[i-1]
+      log.targ.dens[i] <- log.targ.dens[i-1]
+    }
+    
+    if (i %% round(0.05*N.mc) == 0) { # To monitor progress
+      cat(round(i/N.mc, 2)*100, "% done \n", sep = "")
+    }
+    
+    
+    if (i %% 500 == 0) { # adapting the proposal covariance every 500 steps
+      proposal.cov <- cov(t(theta.s[,((i-499):i)]))
+    }
+    
+  }
+  
+  return(list(theta = theta.s, ar = mean(AR)))
+  
+}
+
+
+
+## proposal (normal)
+
+normal.proposal <- function(theta, cov.mat) {
+  # theta = (beta, gamma, S_0, I_0, sigma)
+  
+  # multivariate normal proposal
+  prop <- rmvnorm(n = 1,
+                  mean = theta,
+                  sigma = cov.mat)
+  
+  while (sum(prop<0) > 0) { # need to enforce that everything is > 0
+    prop <- rmvnorm(n = 1,
+                    mean = theta,
+                    sigma = cov.mat)
+  }
+  
+  return(prop)
+  
+}
+
+
+
+
+## Log likelihood
+eval.log.lik <- function(dat, theta) {
+  # theta = (beta, sigma, S_0, I_0, sigma)
+  # 'times' should be in the global environment (from the eyam data)
+  
+  beta <- theta[1] # unpacking parameters from theta vector
+  gamma <- theta[2]
+  S0 <- theta[3]
+  I0 <- theta[4]
+  sigma <- theta[5]
+  n <- length(dat)
+  
+  sid.init <- c(S0, I0, 0)
+  params <- c(beta, gamma)
+  sid.out <- ode(sid.init, times, sir.rhs, params) # runs ode solver
+  deaths <- sid.out[,4]
+  
+  # evaluating the log likelihood
+  -n*log(sigma) - 1/(2*sigma^2) * sum((dat - deaths)^2)
+  
+}
+
+
+log.target.density <- function(log.lik, theta) {
+  # theta = (beta, gamma, S0, I0, sigma)
+  
+  beta <- theta[1]
+  gamma <- theta[2]
+  S0 <- theta[3]
+  I0 <- theta[4]
+  sigma <- theta[5]
+  
+  log.prior.beta <- ifelse(beta < 100, 0, -Inf) #0 # flat prior between 0 and 100
+  log.prior.gamma <- ifelse(gamma < 100, 0, -Inf) #0 # flat prior between 0 and 100
+  log.prior.S0 <- ifelse(S0 > 184, 0, -Inf) #0 # flat prior > 184
+  log.prior.I0 <-  0 # flat prior > 0
+  log.prior.sigma <- dinvgamma(sigma^2, shape = 1, scale = 1, log = T) # inv gamma prior
+  
+  log.lik + log.prior.beta + log.prior.gamma + log.prior.S0 + log.prior.I0 + log.prior.sigma
+  
+}
+
+
+
+
+
+N <- 800000
+burn <- 200000
+
+#init <- c(beta = 0.1479, gamma = 0.0703, S0 = 210.6874, I0 = 5.3154, sigma = 1)
+init <- c(beta = 0.4, gamma = 0.2, S0 = 250, I0 = 10, sigma = 1)
+
+
+if (file.exists("SID_MCMC_1m.RData")) {
+  load(file = "SID_MCMC_1m.RData")
+} else{
+  mcmc.1m <- MH(N.mc = N + burn,
+               dat = eyam$D,
+               prop.f = normal.proposal,
+               log.prop.d = NULL, # not needed if proposal is symmetric
+               log.lik.d = eval.log.lik,
+               log.target.d = log.target.density,
+               init = init,
+               sym = T,
+               #proposal.cov = ,
+               step.size = 1.2
+               )
+  save(mcmc.1m, file = "SID_MCMC_1m.RData")
+}
+
+
+mcmc.out <- mcmc.1m$theta[,((burn+1):(burn+N))] # Removing the burn-in
+
+mcmc.1m$ar # Outputting the acceptance rate
+
+```
+
+```{r trace plots, cache = T, fig.width=12, fig.height=6}
+post.beta <- mcmc.out[1,]
+post.gamma <- mcmc.out[2,]
+post.S0 <- mcmc.out[3,]
+post.I0 <- mcmc.out[4,]
+post.sigma <- mcmc.out[5,]
+
+
+## Trace plots
+par(mfrow = c(1,2))
+plot(post.beta, type = 'l', main = "Beta Trace Plot")
+plot(post.gamma, type = 'l', main = "Gamma Trace Plot")
+plot(post.S0, type = 'l', main = "S_0 Trace Plot")
+plot(post.I0, type = 'l', main = "I_0 Trace Plot")
+plot(post.sigma, type = 'l', main = "Sigma Trace Plot")
+
+```
+
+```{r posterior histograms, cache = T, fig.width=12, fig.height=6}
+
+## marginal posteriors
+par(mfrow = c(1,2))
+hist(post.beta, breaks = 40, main = "Beta Posterior"); abline(v = mean(post.beta), col = 'red')
+hist(post.gamma, breaks = 40, main = "Gamma Posterior"); abline(v = mean(post.gamma), col = 'red')
+hist(post.S0, breaks = 40, main = "S_0 Posterior"); abline(v = mean(post.S0), col = 'red')
+hist(post.I0, breaks = 40, main = "I_0 Posterior"); abline(v = mean(post.I0), col = 'red')
+hist(post.sigma, breaks = 40, main = "Sigma Posterior"); abline(v = mean(post.sigma), col = 'red')
+
+```
+
+```{r plotting}
+
+## Plotting the fitted versus data
+par(mfrow = c(1,1))
+plot(times, eyam$D,
+     col = "red",
+     ylim = c(0, max(eyam$D)+10),
+     main = "Fitted Curve",
+     ylab = "Deaths", xlab = "Time")
+lines(times, fitted(eyam_fit_1), col = 'blue2', lty = 2)
+lines(times, nls_eyam_1(times, mean(post.beta), mean(post.gamma), mean(post.S0), mean(post.I0)), col = 'green')
+legend("topleft", legend = c("Data", "NLS Fitted", "MCMC Fitted"), col = c("red", "blue2", "green"), pch = c(1,NA, NA), lty = c(NA, 2, 1))
+
+
+
+## Plotting entire SID trajectory
+par(mar=c(5.1, 4.1, 4.1, 8.1), xpd=TRUE)
+matplot(times, ode(c(mean(post.S0), mean(post.I0), 0), times, sir.rhs, c(mean(post.beta), mean(post.gamma)))[,2:4], type = 'l', main = "Fitted SID Path", lty = 1, xlab = "Time", ylab = "People")
+points(times, eyam$D, cex = 0.5, col = 3)
+legend("topright", legend = c("Susc.", "Infec.", "Dead", "Death Data"), col = c(1:3, 3), lty = c(1,1,1,NA), pch = c(NA,NA,NA,1), inset=c(-0.3,0))
+
+
+
+# round(cov(t(mcmc.out)), 5) # posterior covariance
+# round(cor(t(mcmc.out)), 5) # posterior correlation
+
+
+## Posterior means
+round(c(beta = mean(post.beta), gamma = mean(post.gamma), S0 = mean(post.S0), I0 = mean(post.I0), sigma = mean(post.sigma)),4)
+
+
+## NLS fits
+round(eyam_fit_1$m$getAllPars(),4)
+
+
+
+```
+
+When running 1 million MCMC samples, we get trace plots that look reasonable. And the posterior means very closely match the fitted parameters values from the NLS fit.
+
+```{r, echo = F, include = F, eval = F}
+test.seq <- seq(0, 10, by = 0.01)
+plot(test.seq, dinvgamma(test.seq, shape = 1, scale = 1), type = 'l')
+```
